@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#1b3a5c">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon-192.png">
+<title>Vitesse vs limite</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+<style>
+:root{--bg:#f3f5f7;--card:#fff;--ink:#14202b;--mut:#5d6b78;--ok:#1f9d55;--warn:#e69b00;--bad:#d62839;--brand:#1b3a5c}
+@media(prefers-color-scheme:dark){:root{--bg:#10171e;--card:#19232d;--ink:#e8eef3;--mut:#93a1ae;--brand:#5b8fc7}}
+*{box-sizing:border-box}
+html,body{height:100%;margin:0}
+body{font:16px/1.4 system-ui,sans-serif;background:var(--bg);color:var(--ink);display:flex;flex-direction:column;padding-top:env(safe-area-inset-top,0);padding-bottom:env(safe-area-inset-bottom,0)}
+#map{flex:1;min-height:200px}
+.panel{background:var(--card);padding:10px 14px;display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;align-items:center;text-align:center}
+.big{font-size:2.4rem;font-weight:700;line-height:1}
+.lbl{font-size:.78rem;color:var(--mut)}
+.limit{width:64px;height:64px;border-radius:50%;border:6px solid var(--bad);background:#fff;color:#000;display:flex;align-items:center;justify-content:center;font-weight:800;font-size:1.5rem;margin:auto}
+.limit.est{border-style:dashed}
+.limit.none{border-color:#999;color:#999;font-size:1rem}
+#speed.ok{color:var(--ok)}#speed.warn{color:var(--warn)}#speed.bad{color:var(--bad)}
+.bar{display:flex;gap:8px;padding:8px 14px 12px;background:var(--card)}
+button{flex:1;font:inherit;font-weight:600;padding:14px 6px;border:0;border-radius:10px;background:var(--brand);color:#fff}
+button.stop{background:var(--bad)}button.sec{background:transparent;color:var(--ink);border:1.5px solid var(--mut)}
+button:disabled{opacity:.4}
+canvas{width:100%;height:90px;background:var(--card);display:block}
+#msg{font-size:.8rem;color:var(--mut);padding:0 14px 6px;background:var(--card);min-height:1.2em}
+.sign{background:#fff;border:3px solid var(--bad);border-radius:50%;color:#000;font:700 11px/20px system-ui;text-align:center;width:26px;height:26px;line-height:20px}
+</style>
+</head>
+<body>
+<div id="map"></div>
+<canvas id="chart" width="800" height="180"></canvas>
+<div class="panel">
+  <div><div class="big" id="speed">–</div><div class="lbl">km/h réels</div></div>
+  <div><div class="limit none" id="limit">?</div><div class="lbl" id="road">limite</div></div>
+  <div><div class="big" id="dist">0.0</div><div class="lbl">km parcourus</div></div>
+</div>
+<div id="msg">Prêt. Appuyez sur Démarrer.</div>
+<div class="bar">
+  <button id="go">Démarrer</button>
+  <button id="exp" class="sec" disabled>Exporter CSV</button>
+  <button id="clr" class="sec">Effacer</button>
+  <button id="key" class="sec">Clé API</button>
+</div>
+<script>
+const $=id=>document.getElementById(id);
+const map=L.map('map',{zoomControl:false}).setView([50.17,3.23],13);
+let token=localStorage.getItem('mbtoken')||'',mb=null,lastMB=0,tl;
+function setTiles(){if(tl)tl.remove();
+  tl=token?L.tileLayer(`https://api.mapbox.com/styles/v1/mapbox/streets-v12/tiles/{z}/{x}/{y}?access_token=${token}`,{tileSize:512,zoomOffset:-1,maxZoom:19,attribution:'© Mapbox © OpenStreetMap'})
+          :L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png',{maxZoom:19,attribution:'© OpenStreetMap'});
+  tl.addTo(map);tl.bringToBack();}
+setTiles();
+let pts=[],watch=null,wake=null,layer=L.layerGroup().addTo(map),me=null,ways=[],fetchCenter=null,fetching=false,lastLimit=null,lastDraw=null;
+try{pts=JSON.parse(localStorage.getItem('trip')||'[]')}catch(e){}
+
+const FR={'FR:urban':50,'FR:rural':80,'FR:motorway':130,'walk':7,'living_street':20};
+function parseMax(v){
+  if(!v)return null; if(FR[v]!=null)return FR[v];
+  const m=String(v).match(/^(\d+)\s*(mph)?/); if(!m)return null;
+  return Math.round(+m[1]*(m[2]?1.609:1));
+}
+// distance point -> segment (m, approximation plane locale)
+function dseg(p,a,b){
+  const k=Math.cos(p.lat*Math.PI/180),R=111320;
+  const px=p.lon*k*R,py=p.lat*R,ax=a.lon*k*R,ay=a.lat*R,bx=b.lon*k*R,by=b.lat*R;
+  const dx=bx-ax,dy=by-ay,l=dx*dx+dy*dy;
+  let t=l?((px-ax)*dx+(py-ay)*dy)/l:0;t=Math.max(0,Math.min(1,t));
+  return Math.hypot(px-(ax+t*dx),py-(ay+t*dy));
+}
+function hav(a,b){const r=Math.PI/180,R=6371000,dl=(b.lat-a.lat)*r,dn=(b.lon-a.lon)*r;
+  const h=Math.sin(dl/2)**2+Math.cos(a.lat*r)*Math.cos(b.lat*r)*Math.sin(dn/2)**2;return 2*R*Math.asin(Math.sqrt(h))}
+
+async function loadWays(p){
+  if(fetching)return;fetching=true;
+  const q=`[out:json][timeout:15];way(around:200,${p.lat},${p.lon})["highway"];out tags geom;`;
+  try{
+    const r=await fetch('https://overpass-api.de/api/interpreter',{method:'POST',body:'data='+encodeURIComponent(q)});
+    const j=await r.json();
+    ways=j.elements.filter(w=>w.geometry).map(w=>({name:w.tags.name||w.tags.ref||'',hw:w.tags.highway,max:parseMax(w.tags.maxspeed),g:w.geometry}));
+    fetchCenter={lat:p.lat,lon:p.lon};$('msg').textContent='';
+  }catch(e){$('msg').textContent='Limites indisponibles (réseau ?) – nouvel essai bientôt.'}
+  fetching=false;
+}
+function lookup(p){
+  if(!fetchCenter||hav(fetchCenter,p)>120)loadWays(p);
+  let best=null,bd=30;
+  for(const w of ways)for(let i=0;i<w.g.length-1;i++){
+    const d=dseg(p,w.g[i],w.g[i+1]);
+    // préfère les voies avec limite si presque aussi proches
+    if(d<bd||(best&&d<bd+8&&best.max==null&&w.max!=null)){bd=Math.min(d,bd);best=w}
+  }
+  return best;
+}
+const colour=(s,l)=>l==null?'#6b7a88':s<=l?'#1f9d55':s<=l*1.1?'#e69b00':'#d62839';
+
+const GUESS={motorway:130,motorway_link:90,trunk:110,primary:80,secondary:80,tertiary:80,unclassified:80,residential:50,living_street:20,service:30,track:30};
+const guess=h=>GUESS[h]??null;
+async function queryMB(){
+  lastMB=Date.now();const s=pts.slice(-4);if(s.length<2)return;
+  const u=`https://api.mapbox.com/matching/v5/mapbox/driving/${s.map(p=>p.lon.toFixed(6)+','+p.lat.toFixed(6)).join(';')}?annotations=maxspeed&overview=false&radiuses=${s.map(()=>30).join(';')}&timestamps=${s.map(p=>Math.floor(Date.parse(p.t)/1000)).join(';')}&access_token=${token}`;
+  try{
+    const r=await fetch(u);
+    if(r.status==401){$('msg').textContent='Clé Mapbox refusée : vérifiez-la.';return}
+    const j=await r.json();
+    const legs=(j.matchings||[]).flatMap(m=>m.legs),a=legs.length&&legs[legs.length-1].annotation;
+    const e=a&&a.maxspeed&&a.maxspeed[a.maxspeed.length-1];
+    if(e&&e.speed!=null){const l=s[s.length-1];mb={v:Math.round(e.speed*(e.unit==='mph'?1.609:1)),t:Date.now(),lat:l.lat,lon:l.lon}}
+  }catch(err){}
+}
+function onPos(pos){
+  const c=pos.coords;if(c.accuracy>60)return;
+  const p={t:new Date(pos.timestamp).toISOString(),lat:c.latitude,lon:c.longitude,acc:Math.round(c.accuracy)};
+  const prev=pts[pts.length-1];
+  let v=c.speed;
+  if(v==null&&prev)v=hav(prev,p)/Math.max(1,(pos.timestamp-Date.parse(prev.t))/1000);
+  p.kmh=Math.round((v||0)*3.6);
+  const w=lookup(p);
+  p.road=w?w.name:'';p.hw=w?w.hw:'';
+  if(mb&&Date.now()-mb.t<25000&&hav(mb,p)<150){p.lim=mb.v;p.src='mapbox'}
+  else if(w&&w.max!=null){p.lim=w.max;p.src='osm'}
+  else if(w&&guess(w.hw)!=null){p.lim=guess(w.hw);p.src='estimee'}
+  else{p.lim=null;p.src=''}
+  if(token&&Date.now()-lastMB>6000)queryMB();
+  pts.push(p);
+  if(pts.length%5==0)try{localStorage.setItem('trip',JSON.stringify(pts))}catch(e){}
+  hud(p);drawPoint(prev,p);chart();
+  map.panTo([p.lat,p.lon],{animate:true});
+  $('exp').disabled=false;
+}
+function hud(p){
+  const s=$('speed');s.textContent=p.kmh;
+  s.className='big '+(p.lim==null?'':p.kmh<=p.lim?'ok':p.kmh<=p.lim*1.1?'warn':'bad');
+  const l=$('limit');l.textContent=p.lim==null?'?':p.lim;l.className='limit'+(p.lim==null?' none':'')+(p.src==='estimee'?' est':'');
+  $('road').textContent=(p.road||'limite')+(p.src==='estimee'?' (estimée)':'');
+  let d=0;for(let i=1;i<pts.length;i++)d+=hav(pts[i-1],pts[i]);
+  $('dist').textContent=(d/1000).toFixed(1);
+}
+function drawPoint(a,b){
+  if(a)L.polyline([[a.lat,a.lon],[b.lat,b.lon]],{color:colour(b.kmh,b.lim),weight:6,opacity:.9})
+    .bindPopup(`${b.kmh} km/h · limite ${b.lim??'inconnue'}<br>${b.road||''}<br>${b.t.slice(11,19)}`).addTo(layer);
+  if(b.lim!==lastDraw){
+    L.marker([b.lat,b.lon],{icon:L.divIcon({className:'',html:`<div class="sign">${b.lim??'?'}</div>`,iconSize:[26,26]})}).addTo(layer);
+    lastDraw=b.lim;
+  }
+  if(!me)me=L.circleMarker([b.lat,b.lon],{radius:7,color:'#fff',weight:2,fillColor:'#1b3a5c',fillOpacity:1}).addTo(map);
+  me.setLatLng([b.lat,b.lon]);
+}
+function redraw(){
+  layer.clearLayers();lastDraw=null;
+  pts.forEach((p,i)=>drawPoint(pts[i-1],p));
+  if(pts.length){const b=L.latLngBounds(pts.map(p=>[p.lat,p.lon]));map.fitBounds(b,{padding:[20,20]});hud(pts[pts.length-1])}
+  chart();$('exp').disabled=!pts.length;
+}
+function chart(){
+  const c=$('chart'),x=c.getContext('2d'),W=c.width,H=c.height;x.clearRect(0,0,W,H);
+  const d=pts.slice(-120);if(d.length<2)return;
+  const mx=Math.max(50,...d.map(p=>Math.max(p.kmh,p.lim||0)))*1.1,X=i=>i/(d.length-1)*W,Y=v=>H-v/mx*(H-10)-5;
+  x.lineWidth=3;
+  x.strokeStyle='#d62839';x.beginPath();let on=false;
+  d.forEach((p,i)=>{if(p.lim==null){on=false;return}on?x.lineTo(X(i),Y(p.lim)):x.moveTo(X(i),Y(p.lim));on=true});x.stroke();
+  x.strokeStyle='#5b8fc7';x.beginPath();d.forEach((p,i)=>i?x.lineTo(X(i),Y(p.kmh)):x.moveTo(X(i),Y(p.kmh)));x.stroke();
+  x.fillStyle='#93a1ae';x.font='20px sans-serif';x.fillText('bleu : vitesse réelle   rouge : limite',8,20);
+}
+async function start(){
+  if(!navigator.geolocation){$('msg').textContent='Géolocalisation non supportée.';return}
+  watch=navigator.geolocation.watchPosition(onPos,e=>$('msg').textContent='GPS : '+e.message,{enableHighAccuracy:true,maximumAge:0,timeout:20000});
+  try{wake=await navigator.wakeLock.request('screen')}catch(e){}
+  $('go').textContent='Arrêter';$('go').className='stop';$('msg').textContent='Enregistrement… gardez l’écran allumé.';
+}
+function stop(){
+  navigator.geolocation.clearWatch(watch);watch=null;if(wake)wake.release();
+  try{localStorage.setItem('trip',JSON.stringify(pts))}catch(e){}
+  $('go').textContent='Démarrer';$('go').className='';$('msg').textContent=pts.length+' points enregistrés.';
+}
+$('go').onclick=()=>watch==null?start():stop();
+$('clr').onclick=()=>{if(watch!=null)stop();if(!pts.length||confirm('Effacer le trajet ?')){pts=[];localStorage.removeItem('trip');lastDraw=null;layer.clearLayers();chart();$('exp').disabled=true;$('speed').textContent='–';$('dist').textContent='0.0'}};
+$('key').onclick=()=>{
+  const t=prompt('Collez votre jeton Mapbox public (pk...). Laissez vide pour le retirer.',token);
+  if(t===null)return;token=t.trim();localStorage.setItem('mbtoken',token);mb=null;setTiles();
+  $('msg').textContent=token?'Clé enregistrée : limites Mapbox activées.':'Sans clé : limites OpenStreetMap + estimation.';
+};
+$('exp').onclick=()=>{
+  const h='horodatage;latitude;longitude;vitesse_kmh;limite_kmh;exces_kmh;precision_m;route;type_route;source_limite';
+  const rows=pts.map(p=>[p.t,p.lat.toFixed(6),p.lon.toFixed(6),p.kmh,p.lim??'',p.lim!=null?p.kmh-p.lim:'',p.acc,'"'+(p.road||'').replace(/"/g,'""')+'"',p.hw,p.src||''].join(';'));
+  const blob=new Blob(['\ufeff'+[h,...rows].join('\n')],{type:'text/csv;charset=utf-8'});
+  const a=document.createElement('a');a.href=URL.createObjectURL(blob);
+  a.download='trajet_'+new Date().toISOString().slice(0,16).replace(/[:T]/g,'-')+'.csv';a.click();
+};
+document.addEventListener('visibilitychange',async()=>{if(!document.hidden&&watch!=null){try{wake=await navigator.wakeLock.request('screen')}catch(e){}}});
+if(pts.length)redraw();
+if('serviceWorker' in navigator)navigator.serviceWorker.register('sw.js').catch(()=>{});
+</script>
+</body>
+</html>
